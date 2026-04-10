@@ -1,0 +1,10 @@
+# Do not save, Do not track, Do not upload anything in this list to GitHub or any other version control system. This is for local development only.
+__pycache__/
+*.py[cod]
+*~
+venv/
+.env
+data/*
+!data/.keep
+*.pt
+*.pth
