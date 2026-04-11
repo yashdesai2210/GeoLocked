@@ -2,5 +2,5 @@ torch
 torchvision
 pytorch-lightning
 transformers
-datasets
+datasets==2.19.1
 s2sphere

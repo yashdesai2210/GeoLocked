@@ -179,14 +179,34 @@ def main():
         split="train", 
         streaming=True,
         trust_remote_code=True
-    ).take(100) # For testing, we take a subset of the stream. Remove .take() for full training.
+    ) # For testing, we take a subset of the stream. Remove .take() for full training.
     
     # DataLoader
     # batch_size=4 is safe for A100 when dealing with 5 crops per image (effectively batch size 20 to the backbones)
-    train_loader = DataLoader(dataset, batch_size=1, collate_fn=collator, num_workers=0)
+    train_loader = DataLoader(
+        dataset, 
+        batch_size=32, 
+        collate_fn=collator, 
+        num_workers=1,           # TODO: make 0 if working on personal desktop
+        pin_memory=True,         # Speeds up the transfer from RAM to GPU VRAM
+        prefetch_factor=4,        # Always keep 2 batches ready and waiting for the GPU
+        persistent_workers=True
+        ).shuffle(seed=42, buffer_size=1000)
     
     # Initialize Model
     model = GeoLightningModel()
+    
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    checkpoint = ModelCheckpoint(
+        dirpath="checkpoints/",
+        filename="geoguessr-{epoch:02d}-{step:05d}",
+        every_n_train_steps=500, # Save every 500 batches
+        save_top_k=3, # Keep all checkpoints (or set to 3 to save space)
+        monitor="loss",   # <--- Tell it to watch the 'loss' you logged
+        mode="min",       # <--- We want the SMALLEST loss
+        save_last=True    # <--- Also always keeps the very latest one
+        )
     
     # Initialize PyTorch Lightning Trainer
     trainer = pl.Trainer(
@@ -195,7 +215,8 @@ def main():
         devices=1,
         accumulate_grad_batches=4,   # Simulates a larger batch size of 16
         precision="16-mixed",        # MASSIVE speedup on A100 GPUs
-        log_every_n_steps=10
+        log_every_n_steps=10,
+        callbacks=[checkpoint]
     )
     
     print("Starting Training Loop...")
