@@ -7,4 +7,4 @@ venv/
 data/*
 !data/.keep
 *.pt
-*.pth
+lightning_logs/
