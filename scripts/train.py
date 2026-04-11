@@ -36,10 +36,10 @@ def main():
     # streaming to load one by one, immediately discarding when done, saving vRAM and storage
     print("Connecting to OSV5M Stream...")
     dataset = load_dataset(
-        "osv5m/osv5m",             # 1. Point directly to the official dataset repo
+        'osv5m/osv5m',             # 1. Point directly to the official dataset repo
         split="train", 
         streaming=True,
-        trust_remote_code=True     # 2. <--- This is the magic flag you need
+        trust_remote_code=True
     )
     cropper = CropTransform()
 
