@@ -1,5 +1,6 @@
 torch
 torchvision
+pytorch-lightning
 transformers
 datasets
 s2sphere
