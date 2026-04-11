@@ -54,7 +54,7 @@ def main():
 
     for step, item in enumerate(train_loader):
         print(f"-> Successfully downloaded Image {step + 1}...")
-        lat, lon = item['lat'], item['lon']
+        lat, lon = item['latitude'], item['longitude']
         s2_label = CoordsToS2(lat, lon, level=12)
         
         raw_image = item['image'].convert("RGB")
