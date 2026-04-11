@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 from datasets import load_dataset
+from torch.utils.data import DataLoader
 
 from src.data.geometry import CoordsToS2
 from src.data.transform import CropTransform
@@ -36,11 +37,12 @@ def main():
     # streaming to load one by one, immediately discarding when done, saving vRAM and storage
     print("Connecting to OSV5M Stream...")
     dataset = load_dataset(
-        'osv5m/osv5m',             # 1. Point directly to the official dataset repo
+        "osv5m/osv5m", 
         split="train", 
         streaming=True,
         trust_remote_code=True
-    )
+    ).take(10)
+    
     cropper = CropTransform()
 
     print("Starting Training Loop...")
@@ -48,7 +50,10 @@ def main():
     accumulation_steps = 4 
     optimizer.zero_grad()
 
-    for step, item in enumerate(dataset):
+    train_loader = DataLoader(dataset, batch_size=None, num_workers=0)
+
+    for step, item in enumerate(train_loader):
+        print(f"-> Successfully downloaded Image {step + 1}...")
         lat, lon = item['lat'], item['lon']
         s2_label = CoordsToS2(lat, lon, level=12)
         
@@ -75,7 +80,7 @@ def main():
             optimizer.zero_grad()
             print(f"Step {step+1} | Loss: {loss.item() * accumulation_steps:.4f}")
 
-        #if step > 10: break # Small test break
+        if step > 10: break # Small test break
 
 if __name__ == "__main__":
     main()
