@@ -1,6 +1,7 @@
 import sys
 import os
 
+
 # Force Python to ignore broken Windows SSL paths
 if "SSL_CERT_FILE" in os.environ:
     del os.environ["SSL_CERT_FILE"]
@@ -179,7 +180,7 @@ def main():
         split="train", 
         streaming=True,
         trust_remote_code=True
-    ) # For testing, we take a subset of the stream. Remove .take() for full training.
+    ).shuffle(seed=42, buffer_size=1000) # For testing, we take a subset of the stream. Remove .take() for full training.
     
     # DataLoader
     # batch_size=4 is safe for A100 when dealing with 5 crops per image (effectively batch size 20 to the backbones)
@@ -191,7 +192,7 @@ def main():
         pin_memory=True,         # Speeds up the transfer from RAM to GPU VRAM
         prefetch_factor=4,        # Always keep 2 batches ready and waiting for the GPU
         persistent_workers=True
-        ).shuffle(seed=42, buffer_size=1000)
+        )
     
     # Initialize Model
     model = GeoLightningModel()
@@ -201,8 +202,8 @@ def main():
     checkpoint = ModelCheckpoint(
         dirpath="checkpoints/",
         filename="geoguessr-{epoch:02d}-{step:05d}",
-        every_n_train_steps=500, # Save every 500 batches
-        save_top_k=3, # Keep all checkpoints (or set to 3 to save space)
+        every_n_train_steps=100, # Save every 100 batches
+        save_top_k=1, # Keep all checkpoints (or set to 1 to save space)
         monitor="loss",   # <--- Tell it to watch the 'loss' you logged
         mode="min",       # <--- We want the SMALLEST loss
         save_last=True    # <--- Also always keeps the very latest one
