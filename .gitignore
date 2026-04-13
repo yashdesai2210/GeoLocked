@@ -7,4 +7,6 @@ venv/
 data/*
 !data/.keep
 *.pt
+checkpoints/
 lightning_logs/
+*.ckpt
