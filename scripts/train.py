@@ -5,6 +5,8 @@ import os
 HOME_DIR = os.path.expanduser("~")
 os.environ["TMPDIR"] = os.path.join(HOME_DIR, "tmp")
 os.makedirs(os.environ["TMPDIR"], exist_ok=True)
+# Tell Hugging Face to wait 5 minutes instead of 10 seconds before giving up
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"
 
 # Force Python to ignore broken Windows SSL paths
 if "SSL_CERT_FILE" in os.environ:
@@ -58,6 +60,7 @@ class OSV5MCollator:
         labels = []
         actual_lat = []
         actual_lon = []
+        cities, countries = [], []
         
         for item in batch:
             # 1. Target S2 Label
@@ -72,6 +75,8 @@ class OSV5MCollator:
             city = item.get('city', 'Unknown City')
             region = item.get('region', 'Unknown Region')
             country = item.get('country', 'Unknown Country')
+            cities.append(city)
+            countries.append(country)
             climate = item.get('climate', 'Unknown')
             drive_side = 'left' if item.get('drive_side') == 1 else 'right'
             
@@ -101,7 +106,9 @@ class OSV5MCollator:
             "attention_mask": text_inputs.get("attention_mask", None),
             "labels": labels,
             "actual_lat": torch.tensor(actual_lat, dtype=torch.float),
-            "actual_lon": torch.tensor(actual_lon, dtype=torch.float)
+            "actual_lon": torch.tensor(actual_lon, dtype=torch.float),
+            "city": cities,
+            "country": countries
         }
 
 # ==========================================
@@ -190,6 +197,29 @@ class GeoLightningModel(pl.LightningModule):
             # Calculate Haversine and get the average distance for the batch
             distances = distance(actual_lat, actual_lon, pred_lat, pred_lon)
             mean_dist_km = torch.mean(distances)
+
+        if batch_idx % 50 == 0:
+            # Look at the first item in the current batch
+            true_city = batch.get('city', ['Unknown'])[0]
+            true_country = batch.get('country', ['Unknown'])[0]
+            
+            # Get the coordinates of the model's top guess for that same item
+            guess_lat = pred_lat[0].item()
+            guess_lon = pred_lon[0].item()
+            dist_val = distances[0].item()
+            
+            # 1. Print to Terminal
+            print(f"\n[Step {self.global_step}] Sanity Check:")
+            print(f"ACTUAL: {true_city}, {true_country}")
+            print(f"GUESS:  ({guess_lat:.2f}, {guess_lon:.2f}) — {dist_val:.0f} km away")
+            
+            # 2. Save to a Text File for later review
+            log_dir = os.path.join(os.path.dirname(__file__), '..', 'lightning_logs')
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, "guess_log.txt")
+            
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"Step {self.global_step:05d} | Dist: {dist_val:5.0f} km | Guess: ({guess_lat:6.2f}, {guess_lon:6.2f}) | Actual: {true_city}, {true_country}\n")
         
         # Logging for Weights & Biases / TensorBoard
         self.log('s2_loss', s2_loss, prog_bar=True)
@@ -246,9 +276,6 @@ def main():
         drop_last=True,           # Prevents weird small batches at the very end
         )
     
-    s2_to_class = vocab["s2_to_class"]
-    class_to_s2 = vocab["class_to_s2"] # Get the reverse mapping too!
-    
     import s2sphere
     
     centroids = torch.zeros((NUM_CLASSES, 2))
@@ -279,7 +306,7 @@ def main():
         max_steps=50000,             # Use max_steps instead of epochs for streaming data
         accelerator="gpu",           # Auto-detects your A100
         devices=1,
-        accumulate_grad_batches=1,   # Simulates a larger batch size of 16
+        accumulate_grad_batches=4,   # Simulates a larger batch size of 16
         precision="16-mixed",        # MASSIVE speedup on A100 GPUs
         log_every_n_steps=10,
         callbacks=[checkpoint]
