@@ -199,27 +199,46 @@ class GeoLightningModel(pl.LightningModule):
             mean_dist_km = torch.mean(distances)
 
         if batch_idx % 50 == 0:
-            # Look at the first item in the current batch
             true_city = batch.get('city', ['Unknown'])[0]
             true_country = batch.get('country', ['Unknown'])[0]
             
-            # Get the coordinates of the model's top guess for that same item
-            guess_lat = pred_lat[0].item()
-            guess_lon = pred_lon[0].item()
-            dist_val = distances[0].item()
+            # 1. Get Top 3 probabilities
+            probs = torch.softmax(s2_logits[0], dim=0)
+            top_probs, top_classes = torch.topk(probs, 3)
             
-            # 1. Print to Terminal
-            print(f"\n[Step {self.global_step}] Sanity Check:")
-            print(f"ACTUAL: {true_city}, {true_country}")
-            print(f"GUESS:  ({guess_lat:.2f}, {guess_lon:.2f}) — {dist_val:.0f} km away")
+            # 2. THE SPEED HACK: Pull EVERYTHING to the CPU in one single trip
+            top_probs_cpu = top_probs.detach().cpu()
+            g_coords_cpu = self.class_centroids[top_classes].detach().cpu()
+            t_lat = actual_lat[0].detach().cpu()
+            t_lon = actual_lon[0].detach().cpu()
             
-            # 2. Save to a Text File for later review
+            # 3. Calculate distance for all 3 guesses at once mathematically 
+            dists_cpu = distance(
+                t_lat.expand(3), t_lon.expand(3), 
+                g_coords_cpu[:, 0], g_coords_cpu[:, 1]
+            )
+            
+            # 4. Format the text in RAM
             log_dir = os.path.join(os.path.dirname(__file__), '..', 'lightning_logs')
             os.makedirs(log_dir, exist_ok=True)
             log_file = os.path.join(log_dir, "guess_log.txt")
             
+            log_str = f"\n--- Step {self.global_step:05d} | Actual: {true_city}, {true_country} ---\n"
+            print(f"\n[Step {self.global_step}] Sanity Check: ACTUAL -> {true_city}, {true_country}")
+            
+            for i in range(3):
+                p_val = top_probs_cpu[i].item() * 100
+                g_lat = g_coords_cpu[i, 0].item()
+                g_lon = g_coords_cpu[i, 1].item()
+                dist_val = dists_cpu[i].item()
+                
+                line = f"  {i+1}. {p_val:5.1f}% | {dist_val:5.0f} km | Guess: ({g_lat:6.2f}, {g_lon:6.2f})"
+                print(line)
+                log_str += line + "\n"
+                
+            # 5. Write to the hard drive ONCE
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"Step {self.global_step:05d} | Dist: {dist_val:5.0f} km | Guess: ({guess_lat:6.2f}, {guess_lon:6.2f}) | Actual: {true_city}, {true_country}\n")
+                f.write(log_str)
         
         # Logging for Weights & Biases / TensorBoard
         self.log('s2_loss', s2_loss, prog_bar=True)
@@ -232,8 +251,19 @@ class GeoLightningModel(pl.LightningModule):
     def configure_optimizers(self):
         # Only optimize parameters that require gradients (Fusion Head + Projections)
         trainable_params = filter(lambda p: p.requires_grad, self.parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
-        return optimizer
+        optimizer = torch.optim.AdamW(trainable_params, lr=3e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=50000,   # Tell it the total journey is 50,000 steps
+            eta_min=1e-6   # Never let the learning rate hit absolute zero
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step"  # Tell it to update the curve after every batch, not every epoch
+            }
+        }
 
 # ==========================================
 # 3. Main Execution
