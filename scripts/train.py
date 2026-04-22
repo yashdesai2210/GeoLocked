@@ -173,7 +173,7 @@ class GeoLightningModel(pl.LightningModule):
         siglip_text_vecs = text_out.pooler_output
         
         # 3. Calculate S2 Geographic Classification Loss
-        s2_loss = F.cross_entropy(s2_logits, labels)
+        s2_loss = F.cross_entropy(s2_logits, labels, label_smoothing=0.15) #removes peru bias, not allowed to be more than 85% confident in any class
         
         # 4. Calculate Text-Image Alignment Loss
         # We target '1' because we want the cosine similarity to be perfectly matched
@@ -297,7 +297,7 @@ def main():
     # batch_size=4 is safe for A100 when dealing with 5 crops per image (effectively batch size 20 to the backbones)
     train_loader = DataLoader(
         dataset, 
-        batch_size=32, 
+        batch_size=16, 
         collate_fn=collator, 
         num_workers=1,           # TODO: make 0 if working on personal desktop
         pin_memory=True,         # Speeds up the transfer from RAM to GPU VRAM
@@ -336,7 +336,7 @@ def main():
         max_steps=50000,             # Use max_steps instead of epochs for streaming data
         accelerator="gpu",           # Auto-detects your A100
         devices=1,
-        accumulate_grad_batches=4,   # Simulates a larger batch size of 16
+        accumulate_grad_batches=2,   # Simulates a larger batch size of 16
         precision="16-mixed",        # MASSIVE speedup on A100 GPUs
         log_every_n_steps=10,
         callbacks=[checkpoint]
