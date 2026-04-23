@@ -138,6 +138,10 @@ class GeoLightningModel(pl.LightningModule):
         
         self.cosine_loss = nn.CosineEmbeddingLoss()
 
+        peru_lat, peru_lon = -12.12, -77.02
+        distances = (self.class_centroids[:, 0] - peru_lat)**2 + (self.class_centroids[:, 1] - peru_lon)**2
+        self.peru_idx = torch.argmin(distances).item()
+
     def forward(self, pixel_values):
         # Flatten the 5 crops into the batch dimension: [B*5, C, H, W]
         B, N, C, H, W = pixel_values.shape
@@ -164,6 +168,8 @@ class GeoLightningModel(pl.LightningModule):
         
         # 1. Forward pass for images
         s2_logits, siglip_image_vecs = self(pixel_values)
+
+        s2_logits[:, self.peru_idx] = -20.0 #make peru weight negative
         
         # 2. Forward pass for text (Built-in extractor)
         text_out = self.siglip.text_model(
@@ -251,10 +257,11 @@ class GeoLightningModel(pl.LightningModule):
     def configure_optimizers(self):
         # Only optimize parameters that require gradients (Fusion Head + Projections)
         trainable_params = filter(lambda p: p.requires_grad, self.parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=3e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=0.05)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, 
-            T_max=50000,   # Tell it the total journey is 50,000 steps
+            T_0=50000,
+            T_mult=1,
             eta_min=1e-6   # Never let the learning rate hit absolute zero
         )
         return {
@@ -317,40 +324,67 @@ def main():
         centroids[class_id, 0] = lat_lng.lat().degrees
         centroids[class_id, 1] = lat_lng.lng().degrees
         
-    model = GeoLightningModel(centroids)
-    
     from pytorch_lightning.callbacks import ModelCheckpoint
 
     checkpoint = ModelCheckpoint(
-        dirpath="checkpoints/",
-        filename="geoguessr-{epoch:02d}-{step:05d}",
-        every_n_train_steps=50, # Save every 100 batches
-        save_top_k=1, # Keep all checkpoints (or set to 1 to save space)
-        save_last=True,    # <--- Also always keeps the very latest one
-        monitor=None   # <--- Tell it to watch the 'loss' you logged
-        #mode="min",       # <--- We want the SMALLEST loss
-        )
+        dirpath="checkpoints_stage2/", 
+        filename="geoguessr-stage2-{epoch:02d}-{step:05d}",
+        every_n_train_steps=50, 
+        save_top_k=1, 
+        save_last=True,    
+        monitor=None   
+    )
     
-    # Initialize PyTorch Lightning Trainer
     trainer = pl.Trainer(
-        max_steps=50000,             # Use max_steps instead of epochs for streaming data
-        accelerator="gpu",           # Auto-detects your A100
+        max_steps=50000,             
+        accelerator="gpu",           
         devices=1,
-        accumulate_grad_batches=2,   # Simulates a larger batch size of 16
-        precision="16-mixed",        # MASSIVE speedup on A100 GPUs
+        accumulate_grad_batches=2,   
+        precision="16-mixed",        
         log_every_n_steps=10,
         callbacks=[checkpoint]
     )
     
-    print("Starting Training Loop...")
-    ckpt_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'last.ckpt')
-    
-    # Pass it into trainer.fit()
-    trainer.fit(
-        model, 
-        train_loader,
-        ckpt_path=ckpt_path
-    )
+    model = GeoLightningModel(centroids)
+
+    # =========================================================
+    # THE RESUME LOGIC (Bulletproof Stage 2)
+    # =========================================================
+    stage2_ckpt_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints_stage2', 'last.ckpt')
+    stage1_ckpt_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'last.ckpt')
+
+    if os.path.exists(stage2_ckpt_path):
+        # --- SCENARIO A: STAGE 2 CRASHED AND WE ARE RESUMING ---
+        print("Found existing Stage 2 checkpoint! Resuming where we left off...")
+        # We DO NOT do the surgical strike here, because the Peru weight is already deleted in this checkpoint!
+        # We pass ckpt_path so the step counter and Cosine curve resume exactly where they crashed.
+        trainer.fit(
+            model, 
+            train_loader,
+            ckpt_path=stage2_ckpt_path
+        )
+        
+    else:
+        # --- SCENARIO B: STARTING STAGE 2 FOR THE VERY FIRST TIME ---
+        print("Loading Stage 1 Brain and executing Surgical Strike on Peru Bias...")
+        
+        # Load the raw weights from Stage 1
+        checkpoint_data = torch.load(stage1_ckpt_path, map_location="cpu")
+        model.load_state_dict(checkpoint_data['state_dict'])
+        
+        # Calculate which of the 50,000 neurons belongs to Peru
+        peru_lat, peru_lon = -12.12, -77.02
+        distances = (centroids[:, 0] - peru_lat)**2 + (centroids[:, 1] - peru_lon)**2
+        peru_idx = torch.argmin(distances).item()
+                
+        print(f"Peru Anomaly (Neuron #{peru_idx}) neutralized. Bias erased.")
+        print("Starting Stage 2 Training Loop (Full Speed)...")
+        
+        # We DO NOT pass ckpt_path here, forcing a fresh optimizer at Step 0!
+        trainer.fit(
+            model, 
+            train_loader
+        )
 
 if __name__ == "__main__":
     main()

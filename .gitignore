@@ -8,5 +8,6 @@ data/*
 !data/.keep
 *.pt
 checkpoints/
+checkpoints_stage2/
 lightning_logs/
 *.ckpt
