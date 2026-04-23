@@ -35,7 +35,7 @@ NUM_CLASSES = 50000
 
 def distance(lat1, lon1, lat2, lon2):
     # Radius of Earth in kilometers
-    R = 6371.0 
+    R = 6378.1
     
     # Convert degrees to radians
     lat1, lon1, lat2, lon2 = map(torch.deg2rad, [lat1, lon1, lat2, lon2])
@@ -138,12 +138,8 @@ class GeoLightningModel(pl.LightningModule):
         
         self.cosine_loss = nn.CosineEmbeddingLoss()
 
-        peru_lat, peru_lon = -12.12, -77.02
-        distances = (self.class_centroids[:, 0] - peru_lat)**2 + (self.class_centroids[:, 1] - peru_lon)**2
-        self.peru_idx = torch.argmin(distances).item()
-
     def forward(self, pixel_values):
-        # Flatten the 5 crops into the batch dimension: [B*5, C, H, W]
+        # Flatten the 3 crops into the batch dimension: [B*3, C, H, W]
         B, N, C, H, W = pixel_values.shape
         flat_images = pixel_values.view(B * N, C, H, W)
         
@@ -151,11 +147,11 @@ class GeoLightningModel(pl.LightningModule):
         # Explicitly extract the tensor using .pooler_output
         siglip_out = self.siglip.vision_model(pixel_values=flat_images)
         siglip_vecs = siglip_out.pooler_output 
-        siglip_vecs = siglip_vecs.view(B, N, -1).mean(dim=1) # Average the 5 crops -> [B, 768]
+        siglip_vecs = siglip_vecs.view(B, N, -1).mean(dim=1) # Average the 3 crops -> [B, 768]
         
         # --- DINOv3 Vision ---
         dino_out = self.dinov3(flat_images).pooler_output
-        dino_vecs = dino_out.view(B, N, -1).mean(dim=1) # Average the 5 crops -> [B, 384]
+        dino_vecs = dino_out.view(B, N, -1).mean(dim=1) # Average the 3 crops -> [B, 384]
         
         # --- S2 Prediction ---
         s2_logits = self.fusion_head(siglip_vecs, dino_vecs)
@@ -168,8 +164,6 @@ class GeoLightningModel(pl.LightningModule):
         
         # 1. Forward pass for images
         s2_logits, siglip_image_vecs = self(pixel_values)
-
-        s2_logits[:, self.peru_idx] = -20.0 #make peru weight negative
         
         # 2. Forward pass for text (Built-in extractor)
         text_out = self.siglip.text_model(
@@ -304,7 +298,7 @@ def main():
     # batch_size=4 is safe for A100 when dealing with 5 crops per image (effectively batch size 20 to the backbones)
     train_loader = DataLoader(
         dataset, 
-        batch_size=16, 
+        batch_size=48, 
         collate_fn=collator, 
         num_workers=1,           # TODO: make 0 if working on personal desktop
         pin_memory=True,         # Speeds up the transfer from RAM to GPU VRAM
@@ -339,7 +333,8 @@ def main():
         max_steps=50000,             
         accelerator="gpu",           
         devices=1,
-        accumulate_grad_batches=2,   
+        accumulate_grad_batches=5,
+        gradient_clip_val=1.0, #gradient clip brings stability   
         precision="16-mixed",        
         log_every_n_steps=10,
         callbacks=[checkpoint]
@@ -376,9 +371,13 @@ def main():
         peru_lat, peru_lon = -12.12, -77.02
         distances = (centroids[:, 0] - peru_lat)**2 + (centroids[:, 1] - peru_lon)**2
         peru_idx = torch.argmin(distances).item()
-                
-        print(f"Peru Anomaly (Neuron #{peru_idx}) neutralized. Bias erased.")
-        print("Starting Stage 2 Training Loop (Full Speed)...")
+
+        for name, param in model.fusion_head.named_parameters():
+            if param.shape[0] == NUM_CLASSES: 
+                if "bias" in name:
+                    param.data[peru_idx] = -1000.0  
+                else:
+                    param.data[peru_idx] = 0.0
         
         # We DO NOT pass ckpt_path here, forcing a fresh optimizer at Step 0!
         trainer.fit(
