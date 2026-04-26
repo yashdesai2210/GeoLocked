@@ -20,15 +20,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as T
 from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoProcessor
 from datasets import load_dataset
-from datasets import IterableDataset
 import pytorch_lightning as pl
 
 # Import your custom modules
 from src.data.geometry import CoordsToS2
-from src.data.transform import CropTransform
+from src.data.transform import Transform
 from src.models.head import CombineModel
 
 NUM_CLASSES = 50000
@@ -49,9 +49,9 @@ def distance(lat1, lon1, lat2, lon2):
     return R * c
 
 class OSV5MCollator:
-    def __init__(self, processor, cropper, s2_to_class):
+    def __init__(self, processor, fast_transform, s2_to_class):
         self.processor = processor
-        self.cropper = cropper
+        self.fast_transform = fast_transform
         self.s2_to_class = s2_to_class
 
     def __call__(self, batch):
@@ -83,12 +83,12 @@ class OSV5MCollator:
             caption = f"A street view photo taken in {city}, {region}, {country}. The climate classification is {climate} and cars drive on the {drive_side} side of the road."
             captions.append(caption)
             
-            # 3. Image Transforms (yields 5 crops per image)
+            # 3. Fast CPU Image Transform (Just resize and normalize)
             raw_image = item['image'].convert("RGB")
-            img_tensors = self.cropper(raw_image)
-            images.append(img_tensors)
+            img_tensor = self.fast_transform(raw_image)
+            images.append(img_tensor)
         
-        # Stack images into shape: [Batch_Size, 5, 3, 224, 224]
+        # Stack images into shape: [Batch_Size, 3, 224, 224]
         batched_images = torch.stack(images) 
         labels = torch.tensor(labels, dtype=torch.long)
         
@@ -138,13 +138,18 @@ class GeoLightningModel(pl.LightningModule):
         
         self.cosine_loss = nn.CosineEmbeddingLoss()
 
+        # =========================================================
+        # THE GPU MATH TOOLS (Runs on CUDA instantly)
+        # =========================================================
+        self.gpu_blur = T.GaussianBlur(kernel_size=9, sigma=(2.0, 5.0))
+        self.gpu_crop = T.RandomResizedCrop(size=(224, 224), scale=(0.1, 0.4))
+
     def forward(self, pixel_values):
         # Flatten the 3 crops into the batch dimension: [B*3, C, H, W]
         B, N, C, H, W = pixel_values.shape
         flat_images = pixel_values.view(B * N, C, H, W)
         
         # --- SigLIP Vision ---
-        # Explicitly extract the tensor using .pooler_output
         siglip_out = self.siglip.vision_model(pixel_values=flat_images)
         siglip_vecs = siglip_out.pooler_output 
         siglip_vecs = siglip_vecs.view(B, N, -1).mean(dim=1) # Average the 3 crops -> [B, 768]
@@ -159,11 +164,22 @@ class GeoLightningModel(pl.LightningModule):
         return s2_logits, siglip_vecs
 
     def training_step(self, batch, batch_idx):
-        pixel_values = batch['pixel_values']
+        # Shape from CPU: [Batch, 3, 224, 224]
+        base_images = batch['pixel_values'] 
         labels = batch['labels']
         
-        # 1. Forward pass for images
-        s2_logits, siglip_image_vecs = self(pixel_values)
+        # =======================================================
+        # BORED GPU HACK: Generate crops and blur inside VRAM
+        # =======================================================
+        global_view = self.gpu_blur(base_images)
+        crop1 = self.gpu_crop(base_images)
+        crop2 = self.gpu_crop(base_images)
+        
+        # Stack them on the GPU: Shape becomes [Batch, 3, 3, 224, 224]
+        gpu_pixel_values = torch.stack([global_view, crop1, crop2], dim=1)
+        
+        # 1. Forward pass for images (using the GPU-augmented images)
+        s2_logits, siglip_image_vecs = self(gpu_pixel_values)
         
         # 2. Forward pass for text (Built-in extractor)
         text_out = self.siglip.text_model(
@@ -173,17 +189,17 @@ class GeoLightningModel(pl.LightningModule):
         siglip_text_vecs = text_out.pooler_output
         
         # 3. Calculate S2 Geographic Classification Loss
-        s2_loss = F.cross_entropy(s2_logits, labels, label_smoothing=0.15) #removes peru bias, not allowed to be more than 85% confident in any class
+        s2_loss = F.cross_entropy(s2_logits, labels, label_smoothing=0.15) 
         
         # 4. Calculate Text-Image Alignment Loss
-        # We target '1' because we want the cosine similarity to be perfectly matched
         alignment_target = torch.ones(siglip_image_vecs.size(0), device=self.device)
         text_loss = self.cosine_loss(siglip_image_vecs, siglip_text_vecs, alignment_target)
         
         # Combine Losses (0.5 weight on text to prioritize S2 coordinate accuracy)
         total_loss = s2_loss + (0.5 * text_loss)
+        
         with torch.no_grad(): # Do not track gradients for this!
-            # Get the model's guess (the class with the highest probability)
+            # Get the model's guess
             preds = torch.argmax(s2_logits, dim=1)
             
             # Lookup the coordinates for those guesses
@@ -249,20 +265,19 @@ class GeoLightningModel(pl.LightningModule):
         return total_loss
 
     def configure_optimizers(self):
-        # Only optimize parameters that require gradients (Fusion Head + Projections)
         trainable_params = filter(lambda p: p.requires_grad, self.parameters())
         optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=50000,
             T_mult=1,
-            eta_min=1e-6   # Never let the learning rate hit absolute zero
+            eta_min=1e-6 
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step"  # Tell it to update the curve after every batch, not every epoch
+                "interval": "step" 
             }
         }
 
@@ -272,7 +287,6 @@ class GeoLightningModel(pl.LightningModule):
 def main():
     print("Initializing Training Pipeline...")
     
-    # Setup Data Pipeline
     import json
     vocab_path = os.path.join(os.path.dirname(__file__), '..', 'src', 'data', 'vocab.json')
     with open(vocab_path, "r") as f:
@@ -282,8 +296,8 @@ def main():
     class_to_s2 = {int(k): int(v) for k, v in vocab["class_to_s2"].items()}
 
     processor = AutoProcessor.from_pretrained("google/siglip2-base-patch16-224")
-    cropper = CropTransform()
-    collator = OSV5MCollator(processor, cropper, s2_to_class)
+    fast_transform = Transform()
+    collator = OSV5MCollator(processor, fast_transform, s2_to_class)
     
     print("Connecting to OSV5M Stream...")
     dataset = load_dataset(
@@ -292,20 +306,18 @@ def main():
         streaming=True,
         trust_remote_code=True
     )
-    dataset = dataset.shuffle(seed=42, buffer_size=5000) # For testing, we take a subset of the stream.
+    dataset = dataset.shuffle(seed=42, buffer_size=5000) 
 
-    # DataLoader
-    # batch_size=4 is safe for A100 when dealing with 5 crops per image (effectively batch size 20 to the backbones)
     train_loader = DataLoader(
         dataset, 
         batch_size=48, 
         collate_fn=collator, 
-        num_workers=1,           # TODO: make 0 if working on personal desktop
-        pin_memory=True,         # Speeds up the transfer from RAM to GPU VRAM
-        prefetch_factor=8,        # Always keep 2 batches ready and waiting for the GPU
+        num_workers=1,           
+        pin_memory=True,         
+        prefetch_factor=8,        
         persistent_workers=True,
-        drop_last=True,           # Prevents weird small batches at the very end
-        )
+        drop_last=True,           
+    )
     
     import s2sphere
     
@@ -334,7 +346,7 @@ def main():
         accelerator="gpu",           
         devices=1,
         accumulate_grad_batches=5,
-        gradient_clip_val=1.0, #gradient clip brings stability   
+        gradient_clip_val=1.0, 
         precision="16-mixed",        
         log_every_n_steps=10,
         callbacks=[checkpoint]
@@ -349,10 +361,7 @@ def main():
     stage1_ckpt_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'last.ckpt')
 
     if os.path.exists(stage2_ckpt_path):
-        # --- SCENARIO A: STAGE 2 CRASHED AND WE ARE RESUMING ---
         print("Found existing Stage 2 checkpoint! Resuming where we left off...")
-        # We DO NOT do the surgical strike here, because the Peru weight is already deleted in this checkpoint!
-        # We pass ckpt_path so the step counter and Cosine curve resume exactly where they crashed.
         trainer.fit(
             model, 
             train_loader,
@@ -360,14 +369,11 @@ def main():
         )
         
     else:
-        # --- SCENARIO B: STARTING STAGE 2 FOR THE VERY FIRST TIME ---
         print("Loading Stage 1 Brain and executing Surgical Strike on Peru Bias...")
         
-        # Load the raw weights from Stage 1
         checkpoint_data = torch.load(stage1_ckpt_path, map_location="cpu")
         model.load_state_dict(checkpoint_data['state_dict'])
         
-        # Calculate which of the 50,000 neurons belongs to Peru
         peru_lat, peru_lon = -12.12, -77.02
         distances = (centroids[:, 0] - peru_lat)**2 + (centroids[:, 1] - peru_lon)**2
         peru_idx = torch.argmin(distances).item()
@@ -379,7 +385,6 @@ def main():
                 else:
                     param.data[peru_idx] = 0.0
         
-        # We DO NOT pass ckpt_path here, forcing a fresh optimizer at Step 0!
         trainer.fit(
             model, 
             train_loader
