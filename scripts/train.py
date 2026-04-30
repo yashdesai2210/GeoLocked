@@ -266,12 +266,12 @@ class GeoLightningModel(pl.LightningModule):
 
     def configure_optimizers(self):
         trainable_params = filter(lambda p: p.requires_grad, self.parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=0.05)
+        optimizer = torch.optim.AdamW(trainable_params, lr=1e-3, weight_decay=0.01)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, 
-            T_0=50000,
-            T_mult=1,
-            eta_min=1e-6 
+            T_0=1000,
+            T_mult=2,
+            eta_min=1e-5 
         )
         return {
             "optimizer": optimizer,
@@ -306,7 +306,7 @@ def main():
         streaming=True,
         trust_remote_code=True
     )
-    dataset = dataset.shuffle(seed=42, buffer_size=5000) 
+    #dataset = dataset.shuffle(seed=42, buffer_size=5000) 
 
     train_loader = DataLoader(
         dataset, 
@@ -361,11 +361,13 @@ def main():
     stage1_ckpt_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'last.ckpt')
 
     if os.path.exists(stage2_ckpt_path):
-        print("Found existing Stage 2 checkpoint! Resuming where we left off...")
+        # Load ONLY the weights, ignore the old slow optimizer
+        checkpoint_data = torch.load(stage2_ckpt_path, map_location="cpu")
+        model.load_state_dict(checkpoint_data['state_dict'])
+
         trainer.fit(
             model, 
             train_loader,
-            ckpt_path=stage2_ckpt_path
         )
         
     else:
